@@ -87,7 +87,7 @@ def show_banner():
 |____/ \____|\__,_|_| |_| |_|\___|  /_/\_\ \___/ 
 [/bold cyan]"""
     info_text = "[bold white]Author:[/bold white] [green]DGameGT/DGameXO[/green]  |  [bold white]Support:[/bold white] [green]othersupport@dgxo.my.id[/green]"
-    
+
     panel_content = Align.center(ascii_art + "\n" + info_text)
     console.print(Panel(panel_content, border_style="cyan", padding=(1, 2), title="[bold yellow]KLWP Decryptor TUI[/bold yellow]"))
     br()
@@ -150,7 +150,7 @@ def pick_file(title="Pilih File", filetypes=None):
     if filetypes is None:
         filetypes = [("All Files", "*")]
     info(f"Membuka file picker: [dim]{title}[/dim]")
-    
+
     pickers = [_pick_powershell, _pick_tkinter] if platform.system() == "Windows" else [_pick_zenity, _pick_kdialog, _pick_yad, _pick_tkinter]
     for picker in pickers:
         try:
@@ -158,11 +158,13 @@ def pick_file(title="Pilih File", filetypes=None):
             if path:
                 ok(f"Dipilih: [cyan]{path}[/cyan]")
                 return path
-        except: continue
+        except:
+            continue
 
     warn("File picker tidak tersedia, input path manual.")
     p = questionary.path(f"{title} (ketik path):", style=style).ask()
-    if not p: return None
+    if not p:
+        return None
     p = p.strip()
     if not os.path.exists(p):
         err(f"File tidak ditemukan: {p}")
@@ -184,8 +186,10 @@ def read_preset_json(klwp_path):
 
 def java_hashcode(s):
     h = 0
-    for c in s: h = (31 * h + ord(c)) & 0xFFFFFFFF
-    if h >= 0x80000000: h -= 0x100000000
+    for c in s:
+        h = (31 * h + ord(c)) & 0xFFFFFFFF
+    if h >= 0x80000000:
+        h -= 0x100000000
     return h
 
 def derive_key(seed, author, email):
@@ -201,59 +205,134 @@ def decrypt_payload(b64, key):
         cipher = DES.new(key, DES.MODE_ECB)
         dec = cipher.decrypt(encrypted)
         pad = dec[-1]
-        if 0 < pad < 16: dec = dec[:-pad]
+        if 0 < pad < 16:
+            dec = dec[:-pad]
         return dec
     except Exception:
         return None
 
 def score_bytes(data):
-    return sum(1 for b in data[:80] if 32 <= b < 127)
+    if not data:
+        return 0
+    # Cek prefix JSON valid sebagai validasi tambahan
+    try:
+        preview = data[:80]
+        printable = sum(1 for b in preview if 32 <= b < 127)
+        # Bonus kalau dimulai dengan tanda JSON array/object
+        if data[:2] in (b'[{', b'[ '):
+            printable += 10
+        return min(printable, 80)
+    except Exception:
+        return 0
 
 # ── Seed Extraction ───────────────────────────────────────────────────────────
 def extract_seed_from_so(so_path):
     seeds = {}
     try:
-        result = subprocess.run(["strings", "-o", so_path], capture_output=True, text=True, timeout=30)
-        candidates = []
-        for line in result.stdout.strip().splitlines():
-            parts = line.split()
+        # Step 1: Parse section headers buat mapping vaddr <-> file offset
+        readelf = subprocess.run(
+            ["readelf", "-S", "--wide", so_path],
+            capture_output=True, text=True, timeout=30
+        )
+        sections = []
+        for line in readelf.stdout.splitlines():
+            m = re.search(
+                r'\[\s*\d+\]\s+\S+\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)',
+                line
+            )
+            if m:
+                vaddr = int(m.group(1), 16)
+                foff  = int(m.group(2), 16)
+                size  = int(m.group(3), 16)
+                if size > 0:
+                    sections.append((vaddr, foff, size))
+
+        def vaddr_to_foff(va):
+            for base_va, base_off, size in sections:
+                if base_va <= va < base_va + size:
+                    return base_off + (va - base_va)
+            return None
+
+        # Step 2: Kumpulkan kandidat string dengan file offset-nya
+        str_result = subprocess.run(
+            ["strings", "-o", so_path],
+            capture_output=True, text=True, timeout=30
+        )
+        offset_to_str = {}
+        for line in str_result.stdout.strip().splitlines():
+            parts = line.split(None, 1)
             if len(parts) == 2 and parts[0].isdigit():
                 off, s = int(parts[0]), parts[1]
                 if 8 <= len(s) <= 20 and re.match(r'^[a-z0-9]+$', s):
-                    candidates.append((off, s))
+                    offset_to_str[off] = s
 
-        dump = subprocess.run(["objdump", "-d", so_path], capture_output=True, text=True, timeout=60)
+        # Step 3: Disassemble dan map tiap fungsi ke string-nya
+        dump = subprocess.run(
+            ["objdump", "-d", so_path],
+            capture_output=True, text=True, timeout=60
+        )
         txt = dump.stdout
 
         fn_names = ["getPresetUnlockSeed", "getKomponentUnlockSeed", "getServiceDESSeed"]
-        fn_map = {fn: None for fn in fn_names}
+        fn_map   = {fn: None for fn in fn_names}
 
         for fn in fn_names:
-            idx = txt.find(f"<{fn}>")
-            if idx == -1: idx = txt.find(fn)
-            if idx == -1: continue
-            block = txt[idx: idx + 800]
-            for addr_hex in re.findall(r'(?:#|0x)\s*([0-9a-f]{3,})', block):
-                try: addr = int(addr_hex, 16)
-                except ValueError: continue
-                for off, s in candidates:
-                    if abs(off - addr) < 64:
-                        fn_map[fn] = s
-                        break
-                if fn_map[fn]: break
+            # Cari fungsi — coba full JNI name dulu, fallback ke short name
+            idx = txt.find(f"<Java_org_kustom_lib_crypto_SeedHelper_{fn}>")
+            if idx == -1:
+                idx = txt.find(f"<{fn}>")
+            if idx == -1:
+                continue
 
+            block = txt[idx: idx + 600]
+
+            # objdump tulis resolved address sebagai comment setelah #
+            # contoh: lea -0x1e9(%rip),%rsi   # 598 <note_end+0x2c8>
+            for m in re.finditer(r'#\s*([0-9a-f]+)', block):
+                try:
+                    va = int(m.group(1), 16)
+                except ValueError:
+                    continue
+
+                # Coba match langsung (beberapa build kebetulan offset == vaddr)
+                if va in offset_to_str:
+                    fn_map[fn] = offset_to_str[va]
+                    break
+
+                # Konversi vaddr ke file offset lewat section map
+                fo = vaddr_to_foff(va)
+                if fo is not None:
+                    if fo in offset_to_str:
+                        fn_map[fn] = offset_to_str[fo]
+                        break
+                    # Fuzzy match kecil — toleransi alignment 4 byte
+                    for off, s in offset_to_str.items():
+                        if abs(off - fo) <= 4:
+                            fn_map[fn] = s
+                            break
+
+                if fn_map[fn]:
+                    break
+
+        # Fallback heuristic kalau ada yang masih None
         unmapped = [fn for fn in fn_names if fn_map[fn] is None]
-        alpha_candidates = [(off, s) for off, s in candidates if s.isalpha()]
-        if unmapped and alpha_candidates:
-            warn(f"objdump address match gagal untuk: {unmapped}")
-            warn("Menggunakan heuristic fallback — hasil mungkin tidak akurat.")
+        if unmapped:
+            warn(f"Fallback heuristic untuk: {unmapped}")
             used = set(fn_map.values()) - {None}
-            remaining = [s for _, s in alpha_candidates if s not in used]
-            for fn, s in zip(unmapped, remaining): fn_map[fn] = s
+            # Urutkan by offset biar deterministik
+            remaining = sorted(
+                [(off, s) for off, s in offset_to_str.items() if s not in used],
+                key=lambda x: x[0]
+            )
+            for fn, (_, s) in zip(unmapped, remaining):
+                fn_map[fn] = s
+                warn(f"  {fn} -> {s!r} (heuristic, mungkin tidak akurat)")
 
         seeds = {k: v for k, v in fn_map.items() if v}
+
     except Exception as e:
         err(f"Error extract seed: {e}")
+
     return seeds
 
 def extract_seed_from_apk(apk_path):
@@ -264,7 +343,11 @@ def extract_seed_from_apk(apk_path):
                 if not candidates:
                     err("liblocal-config-lib.so tidak ditemukan di APK")
                     return {}
-                target = next((c for c in candidates if "x86_64" in c), next((c for c in candidates if "arm64" in c), candidates[0]))
+                # Prioritas: x86_64 > arm64 > yang lain
+                target = next(
+                    (c for c in candidates if "x86_64" in c),
+                    next((c for c in candidates if "arm64" in c), candidates[0])
+                )
                 dest = os.path.join(tmp, "liblocal-config-lib.so")
                 with z.open(target) as src, open(dest, "wb") as dst:
                     shutil.copyfileobj(src, dst)
@@ -278,19 +361,26 @@ def extract_seed_from_apk(apk_path):
 def menu_check_release():
     separator("Cek Version Release")
     path = pick_klwp()
-    if not path: return
+    if not path:
+        return
     data = read_preset_json(path)
-    if not data: return
+    if not data:
+        return
     release = data.get("preset_info", {}).get("release", "tidak ditemukan")
     br()
-    console.print(Panel(Align.center(f"[bold cyan]Release ID: {release}[/bold cyan]"), border_style="cyan", padding=(1, 4)))
+    console.print(Panel(
+        Align.center(f"[bold cyan]Release ID: {release}[/bold cyan]"),
+        border_style="cyan", padding=(1, 4)
+    ))
 
 def menu_check_author():
     separator("Cek Author")
     path = pick_klwp()
-    if not path: return
+    if not path:
+        return
     data = read_preset_json(path)
-    if not data: return
+    if not data:
+        return
     ib = data.get("preset_info", {})
     br()
     t = Table(show_header=False, box=None, padding=(0, 2))
@@ -303,22 +393,33 @@ def menu_check_author():
 def menu_check_locked():
     separator("Cek Locked Status")
     path = pick_klwp()
-    if not path: return
+    if not path:
+        return
     data = read_preset_json(path)
-    if not data: return
+    if not data:
+        return
     locked = data.get("preset_info", {}).get("locked", False)
     br()
     if locked:
-        console.print(Panel(Align.center("[bold red]LOCKED[/bold red]\nPreset dikunci oleh pemilik"), border_style="red", padding=(1, 4)))
+        console.print(Panel(
+            Align.center("[bold red]LOCKED[/bold red]\nPreset dikunci oleh pemilik"),
+            border_style="red", padding=(1, 4)
+        ))
     else:
-        console.print(Panel(Align.center("[bold green]UNLOCKED[/bold green]\nPreset bebas diedit"), border_style="green", padding=(1, 4)))
+        console.print(Panel(
+            Align.center("[bold green]UNLOCKED[/bold green]\nPreset bebas diedit"),
+            border_style="green", padding=(1, 4)
+        ))
 
 def menu_download_apk():
     separator("Download KLWP APK")
     choice = questionary.select(
-        "Pilih metode:", choices=["Auto — download otomatis", "Manual — cari di browser"], style=style
+        "Pilih metode:",
+        choices=["Auto — download otomatis", "Manual — cari di browser"],
+        style=style
     ).ask()
-    if not choice: return
+    if not choice:
+        return
 
     if "Manual" in choice:
         br()
@@ -331,15 +432,18 @@ def menu_download_apk():
         err("Release ID harus berupa angka.")
         return
 
-    url = DOWNLOAD_BASE.format(release=release_id.strip())
-    output_file = os.path.join(SCRIPT_DIR, f"klwp_{release_id}.apk")
+    url         = DOWNLOAD_BASE.format(release=release_id.strip())
+    output_file = os.path.join(SCRIPT_DIR, f"klwp_{release_id.strip()}.apk")
     br()
     info(f"URL    : {url}")
     info(f"Output : {output_file}")
     br()
 
-    cmd = ["wget", "-O", output_file, url] if shutil.which("wget") else ["curl", "-L", "-o", output_file, url] if shutil.which("curl") else None
-    if not cmd:
+    if shutil.which("wget"):
+        cmd = ["wget", "-O", output_file, url]
+    elif shutil.which("curl"):
+        cmd = ["curl", "-L", "-o", output_file, url]
+    else:
         err("wget / curl tidak ditemukan.")
         return
 
@@ -356,7 +460,8 @@ def menu_download_apk():
 def menu_teardown_apk():
     separator("Teardown APK — Cari Seed")
     apk_path = pick_apk()
-    if not apk_path: return
+    if not apk_path:
+        return
     br()
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as prog:
         t = prog.add_task("Mengekstrak library & mencari seed...", total=None)
@@ -370,20 +475,29 @@ def menu_teardown_apk():
     tbl = Table(title="Seed Ditemukan", border_style="green")
     tbl.add_column("Fungsi", style="dim")
     tbl.add_column("Seed", style="bold cyan")
-    labels = {"getPresetUnlockSeed": "Preset Unlock", "getKomponentUnlockSeed": "Komponent Unlock", "getServiceDESSeed": "Service DES"}
-    for fn, val in seeds.items(): tbl.add_row(labels.get(fn, fn), val)
+    labels = {
+        "getPresetUnlockSeed":    "Preset Unlock",
+        "getKomponentUnlockSeed": "Komponent Unlock",
+        "getServiceDESSeed":      "Service DES",
+    }
+    for fn, val in seeds.items():
+        tbl.add_row(labels.get(fn, fn), val)
     console.print(tbl)
 
 def menu_unlock_preset():
     separator("Unlock Preset")
+
     if not os.path.exists(BLANK_KLWP):
         err("blank.klwp tidak ditemukan.")
+        info("Cara mendapatkannya: buat preset kosong baru di KLWP, lalu export ke folder yang sama dengan script ini dengan nama blank.klwp")
         return
 
     klwp_path = pick_klwp()
-    if not klwp_path: return
+    if not klwp_path:
+        return
     preset_data = read_preset_json(klwp_path)
-    if not preset_data: return
+    if not preset_data:
+        return
 
     ib = preset_data.get("preset_info", {})
     if not ib.get("locked"):
@@ -397,7 +511,8 @@ def menu_unlock_preset():
 
     br()
     apk_path = pick_apk()
-    if not apk_path: return
+    if not apk_path:
+        return
 
     br()
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as prog:
@@ -412,7 +527,7 @@ def menu_unlock_preset():
     all_seed_values = list(dict.fromkeys(v for v in seeds.values() if v))
     info(f"Seed ditemukan: [cyan]{', '.join(all_seed_values)}[/cyan]")
     br()
-    
+
     preset_author = ib.get("author", "")
     preset_email  = ib.get("email",  "")
     info(f"Author preset: [cyan]{preset_author or '(kosong)'}[/cyan] | Email: [cyan]{preset_email or '(kosong)'}[/cyan]")
@@ -420,18 +535,21 @@ def menu_unlock_preset():
 
     mode = questionary.select(
         "Mode input author/email:",
-        choices=["Gunakan dari preset (otomatis)", "Input manual", "Brute force"], style=style
+        choices=["Gunakan dari preset (otomatis)", "Input manual", "Brute force"],
+        style=style
     ).ask()
-    if not mode: return
+    if not mode:
+        return
 
-    if "otomatis" in mode: pairs = [(preset_author, preset_email)]
+    if "otomatis" in mode:
+        pairs = [(preset_author, preset_email)]
     elif "manual" in mode:
         author = questionary.text("Author:", default=preset_author, style=style).ask() or ""
         email  = questionary.text("Email:",  default=preset_email,  style=style).ask() or ""
         pairs  = [(author.strip(), email.strip())]
     else:
-        a_raw = questionary.text("Authors (pisah koma):", default=preset_author, style=style).ask() or ""
-        e_raw = questionary.text("Emails (pisah koma):",  default=preset_email,  style=style).ask() or ""
+        a_raw   = questionary.text("Authors (pisah koma):", default=preset_author, style=style).ask() or ""
+        e_raw   = questionary.text("Emails (pisah koma):",  default=preset_email,  style=style).ask() or ""
         authors = [x.strip() for x in a_raw.split(",") if x.strip()] or [""]
         emails  = [x.strip() for x in e_raw.split(",") if x.strip()] or [""]
         if "" not in authors: authors.append("")
@@ -440,7 +558,7 @@ def menu_unlock_preset():
 
     br()
     total_combos = len(all_seed_values) * len(pairs)
-    info(f"Mencoba [yellow]{total_combos}[/yellow] kombinasi (seed × author/email)...")
+    info(f"Mencoba [yellow]{total_combos}[/yellow] kombinasi (seed x author/email)...")
     br()
 
     results = []
@@ -463,20 +581,27 @@ def menu_unlock_preset():
     best_score, best_seed, best_author, best_email, best_data = results[0]
 
     tbl = Table(title="Hasil Dekripsi (Top 5)", border_style="cyan")
-    tbl.add_column("Rank", style="dim", width=6)
-    tbl.add_column("Score", width=8)
-    tbl.add_column("Seed", style="dim cyan")
+    tbl.add_column("Rank",   style="dim", width=6)
+    tbl.add_column("Score",  width=8)
+    tbl.add_column("Seed",   style="dim cyan")
     tbl.add_column("Author")
     tbl.add_column("Email")
     for i, (sc, sv, au, em, _) in enumerate(results[:5]):
         color = "green" if sc >= 70 else "yellow" if sc >= 40 else "red"
-        tbl.add_row(str(i + 1), f"[{color}]{sc}/80[/{color}]", sv, au or "(kosong)", em or "(kosong)")
+        tbl.add_row(
+            str(i + 1),
+            f"[{color}]{sc}/80[/{color}]",
+            sv,
+            au or "(kosong)",
+            em or "(kosong)"
+        )
     console.print(tbl)
     br()
 
     if best_score < 40:
         err(f"Score {best_score}/80 — key kemungkinan salah.")
-        if not Confirm.ask("Tetap lanjut?"): return
+        if not Confirm.ask("Tetap lanjut?"):
+            return
 
     try:
         layers = json.loads(best_data)
@@ -486,36 +611,55 @@ def menu_unlock_preset():
         return
 
     br()
-    out_path = questionary.text("Simpan output ke:", default=klwp_path.replace(".klwp", "_unlocked.klwp"), style=style).ask()
-    if not out_path: return
+    out_path = questionary.text(
+        "Simpan output ke:",
+        default=klwp_path.replace(".klwp", "_unlocked.klwp"),
+        style=style
+    ).ask()
+    if not out_path:
+        return
+
+    out_path = out_path.strip()
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as prog:
         t = prog.add_task("Merekonstruksi preset...", total=None)
         success = False
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                with zipfile.ZipFile(BLANK_KLWP) as z: z.extractall(tmp)
+                # Ekstrak blank shell
+                with zipfile.ZipFile(BLANK_KLWP) as z:
+                    z.extractall(tmp)
+
+                # Tulis preset.json yang sudah di-merge
                 blank_preset = os.path.join(tmp, "preset.json")
-                with open(blank_preset, "r", encoding="utf-8") as f: shell = json.load(f)
-                
+                with open(blank_preset, "r", encoding="utf-8") as f:
+                    shell = json.load(f)
+
                 shell["preset_info"] = preset_data.get("preset_info", {})
                 shell["preset_info"]["locked"] = False
                 shell["preset_root"] = preset_data.get("preset_root", {})
                 shell["preset_root"].pop("internal_readonly", None)
                 shell["preset_root"]["viewgroup_items"] = layers
-                
-                with open(blank_preset, "w", encoding="utf-8") as f: json.dump(shell, f, ensure_ascii=False, indent=2)
+
+                with open(blank_preset, "w", encoding="utf-8") as f:
+                    json.dump(shell, f, ensure_ascii=False, indent=2)
+
+                # Salin aset dari preset original
                 with zipfile.ZipFile(klwp_path) as zsrc:
                     for name in zsrc.namelist():
                         if name.startswith(("bitmaps/", "fonts/", "icons/")):
                             dest = os.path.join(tmp, name)
                             os.makedirs(os.path.dirname(dest), exist_ok=True)
-                            with zsrc.open(name) as sf, open(dest, "wb") as df: shutil.copyfileobj(sf, df)
-                with zipfile.ZipFile(out_path.strip(), "w", zipfile.ZIP_DEFLATED) as zout:
+                            with zsrc.open(name) as sf, open(dest, "wb") as df:
+                                shutil.copyfileobj(sf, df)
+
+                # Repack
+                with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
                     for root, dirs, files in os.walk(tmp):
                         for file in files:
                             fp = os.path.join(root, file)
                             zout.write(fp, os.path.relpath(fp, tmp))
+
                 success = True
         except Exception as e:
             err(f"Gagal rebuild: {e}")
@@ -523,9 +667,17 @@ def menu_unlock_preset():
 
     br()
     if success:
-        ok(f"Tersimpan: [bold cyan]{out_path.strip()}[/bold cyan] ({os.path.getsize(out_path.strip()) / 1024:.1f} KB)")
+        size_kb = os.path.getsize(out_path) / 1024
+        ok(f"Tersimpan: [bold cyan]{out_path}[/bold cyan] ({size_kb:.1f} KB)")
         br()
-        console.print(Panel("1. Pindah ke [cyan]/sdcard/Kustom/wallpapers/[/cyan]\n2. Buka KLWP → Import\n3. Selesai ✓", title="Langkah Selanjutnya", border_style="green", padding=(1, 2)))
+        console.print(Panel(
+            "1. Pindah ke [cyan]/sdcard/Kustom/wallpapers/[/cyan]\n"
+            "2. Buka KLWP -> Import\n"
+            "3. Selesai",
+            title="Langkah Selanjutnya",
+            border_style="green",
+            padding=(1, 2)
+        ))
 
 # ── Main Menu ─────────────────────────────────────────────────────────────────
 MENU_CHOICES = [
@@ -563,7 +715,8 @@ def main():
             console.print("\n[dim]Keluar dari program...[/dim]\n")
             break
 
-        if choice.startswith("──"): continue
+        if choice.startswith("──"):
+            continue
 
         action = MENU_ACTIONS.get(choice[0])
         if action:
@@ -571,7 +724,8 @@ def main():
             pause()
 
 if __name__ == "__main__":
-    try: main()
+    try:
+        main()
     except KeyboardInterrupt:
         console.print("\n[dim]Dibatalkan.[/dim]")
         sys.exit(0)
