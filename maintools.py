@@ -229,31 +229,65 @@ def score_bytes(data):
 def extract_seed_from_so(so_path):
     seeds = {}
     try:
-        # Step 1: Parse section headers buat mapping vaddr <-> file offset
+        # Step 1: Parse section headers
         readelf = subprocess.run(
             ["readelf", "-S", "--wide", so_path],
             capture_output=True, text=True, timeout=30
         )
         sections = []
+        rodata_vaddr = None
+        rodata_foff  = None
         for line in readelf.stdout.splitlines():
             m = re.search(
-                r'\[\s*\d+\]\s+\S+\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)',
+                r'\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)',
                 line
             )
             if m:
-                vaddr = int(m.group(1), 16)
-                foff  = int(m.group(2), 16)
-                size  = int(m.group(3), 16)
+                name  = m.group(1)
+                vaddr = int(m.group(2), 16)
+                foff  = int(m.group(3), 16)
+                size  = int(m.group(4), 16)
                 if size > 0:
                     sections.append((vaddr, foff, size))
+                if name == ".rodata" and vaddr > 0:
+                    rodata_vaddr = vaddr
+                    rodata_foff  = foff
 
         def vaddr_to_foff(va):
             for base_va, base_off, size in sections:
+                if base_va == 0:
+                    continue
                 if base_va <= va < base_va + size:
                     return base_off + (va - base_va)
             return None
 
-        # Step 2: Kumpulkan kandidat string dengan file offset-nya
+        # Step 2: Baca raw .rodata bytes langsung dari file
+        # Ini fallback paling reliable — parse string langsung dari section
+        rodata_strings = {}  # foff -> string
+        if rodata_foff is not None:
+            with open(so_path, "rb") as f:
+                f.seek(rodata_foff)
+                # Cari semua section yang cover rodata
+                rodata_size = next(
+                    (sz for va, fo, sz in sections if fo == rodata_foff), 0x100
+                )
+                raw = f.read(rodata_size)
+            # Parse null-terminated strings dari raw bytes
+            pos = 0
+            while pos < len(raw):
+                end = raw.find(b'\x00', pos)
+                if end == -1:
+                    break
+                chunk = raw[pos:end]
+                if 8 <= len(chunk) <= 20:
+                    try:
+                        s = chunk.decode('ascii')
+                        if re.match(r'^[a-z0-9]+$', s):
+                            rodata_strings[rodata_foff + pos] = s
+                    except Exception:
+                        pass
+                pos = end + 1
+
         str_result = subprocess.run(
             ["strings", "-o", so_path],
             capture_output=True, text=True, timeout=30
@@ -266,7 +300,8 @@ def extract_seed_from_so(so_path):
                 if 8 <= len(s) <= 20 and re.match(r'^[a-z0-9]+$', s):
                     offset_to_str[off] = s
 
-        # Step 3: Disassemble dan map tiap fungsi ke string-nya
+        all_strings = {**offset_to_str, **rodata_strings}
+
         dump = subprocess.run(
             ["objdump", "-d", so_path],
             capture_output=True, text=True, timeout=60
@@ -277,8 +312,9 @@ def extract_seed_from_so(so_path):
         fn_map   = {fn: None for fn in fn_names}
 
         for fn in fn_names:
-            # Cari fungsi — coba full JNI name dulu, fallback ke short name
-            idx = txt.find(f"<Java_org_kustom_lib_crypto_SeedHelper_{fn}>")
+            idx = txt.find(f"<Java_org_kustom_lib_crypto_SeedHelper_{fn}@@Base>")
+            if idx == -1:
+                idx = txt.find(f"<Java_org_kustom_lib_crypto_SeedHelper_{fn}>")
             if idx == -1:
                 idx = txt.find(f"<{fn}>")
             if idx == -1:
@@ -286,27 +322,27 @@ def extract_seed_from_so(so_path):
 
             block = txt[idx: idx + 600]
 
-            # objdump tulis resolved address sebagai comment setelah #
-            # contoh: lea -0x1e9(%rip),%rsi   # 598 <note_end+0x2c8>
             for m in re.finditer(r'#\s*([0-9a-f]+)', block):
                 try:
                     va = int(m.group(1), 16)
                 except ValueError:
                     continue
 
-                # Coba match langsung (beberapa build kebetulan offset == vaddr)
-                if va in offset_to_str:
-                    fn_map[fn] = offset_to_str[va]
+                if va in rodata_strings:
+                    fn_map[fn] = rodata_strings[va]
                     break
 
-                # Konversi vaddr ke file offset lewat section map
+                if va in all_strings:
+                    fn_map[fn] = all_strings[va]
+                    break
+
                 fo = vaddr_to_foff(va)
                 if fo is not None:
-                    if fo in offset_to_str:
-                        fn_map[fn] = offset_to_str[fo]
+                    if fo in all_strings:
+                        fn_map[fn] = all_strings[fo]
                         break
-                    # Fuzzy match kecil — toleransi alignment 4 byte
-                    for off, s in offset_to_str.items():
+
+                    for off, s in all_strings.items():
                         if abs(off - fo) <= 4:
                             fn_map[fn] = s
                             break
@@ -314,19 +350,32 @@ def extract_seed_from_so(so_path):
                 if fn_map[fn]:
                     break
 
-        # Fallback heuristic kalau ada yang masih None
         unmapped = [fn for fn in fn_names if fn_map[fn] is None]
-        if unmapped:
-            warn(f"Fallback heuristic untuk: {unmapped}")
+        if unmapped and rodata_strings:
+            warn(f"vaddr match gagal, fallback ke .rodata order untuk: {unmapped}")
+            ordered = sorted(rodata_strings.items(), key=lambda x: x[0])
+            known_order = {
+                "getKomponentUnlockSeed": 0,
+                "getServiceDESSeed":      1,
+                "getPresetUnlockSeed":    2,
+            }
+            for fn in unmapped:
+                idx_order = known_order.get(fn)
+                if idx_order is not None and idx_order < len(ordered):
+                    fn_map[fn] = ordered[idx_order][1]
+                    warn(f"  {fn} -> {fn_map[fn]!r} (rodata order fallback)")
+
+        still_unmapped = [fn for fn in fn_names if fn_map[fn] is None]
+        if still_unmapped:
+            warn(f"Last resort heuristic untuk: {still_unmapped}")
             used = set(fn_map.values()) - {None}
-            # Urutkan by offset biar deterministik
             remaining = sorted(
-                [(off, s) for off, s in offset_to_str.items() if s not in used],
+                [(off, s) for off, s in all_strings.items() if s not in used],
                 key=lambda x: x[0]
             )
-            for fn, (_, s) in zip(unmapped, remaining):
+            for fn, (_, s) in zip(still_unmapped, remaining):
                 fn_map[fn] = s
-                warn(f"  {fn} -> {s!r} (heuristic, mungkin tidak akurat)")
+                warn(f"  {fn} -> {s!r} (heuristic, tidak akurat)")
 
         seeds = {k: v for k, v in fn_map.items() if v}
 

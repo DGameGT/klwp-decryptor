@@ -20,7 +20,8 @@
 11. [Step 8: Decrypt and Rebuild the Preset](#step-8-decrypt-and-rebuild-the-preset)
 12. [Step 9: Repack and Import](#step-9-repack-and-import)
 13. [Version-Specific Notes](#version-specific-notes)
-14. [Troubleshooting](#troubleshooting)
+14. [Findings Across Versions](#findings-across-versions)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -144,7 +145,7 @@ For KLWP v3.63 (build `363228708`), the seeds extracted from `lib/x86_64/libloca
 
 - A Linux or macOS environment (WSL works on Windows)
 - `apktool` (version 2.x) installed or available at `~/bin/apktool`
-- `objdump` and `strings` (usually pre-installed on Linux)
+- `objdump`, `strings`, and `readelf` (usually pre-installed on Linux)
 - `python3` with `pycryptodome`: `pip install pycryptodome`
 - The locked `.klwp` file you want to decrypt
 - A best guess of the **author name** and **email** used when the preset was locked
@@ -182,9 +183,8 @@ The `release` field is the Android `versionCode` of the KLWP build used to lock 
 | release value | KLWP version |
 |---|---|
 | `363228708` | 3.63b228708 |
-| `362224415` | 3.62b224415 |
-| `361223012` | 3.61b223012 |
-| `360220710` | 3.60b220710 |
+| `374331712` | 3.74b331712 |
+| `382xxxxxx` | 3.82 |
 
 Format: first 3 digits = major.minor version, remaining digits = build number.
 
@@ -203,6 +203,8 @@ APKMirror: `https://www.apkmirror.com/apk/kustom-industries/klwp-live-wallpaper-
 Download the **Google Play** variant, not AOSP or Huawei, as the native library may differ.
 
 For v3.63: `https://kustom.rocks/download/klwp/363228708/google_release`
+
+> **Note:** Based on findings across v3.63, v3.74, and v3.82, the seed values inside `liblocal-config-lib.so` are identical across all tested versions. In practice, any APK in the v3.6x to v3.8x range can be used for seed extraction. See [Findings Across Versions](#findings-across-versions) for details.
 
 ---
 
@@ -246,23 +248,32 @@ askoeruqwoie
 
 ### Map Strings to Functions
 
-Get file offsets:
+The mapping method differs by version due to a change in how the library stores its strings:
+
+**v3.6x** — Seeds are stored in the `.comment` section (no virtual address). Direct vaddr mapping will fail. Use the `objdump` section dump approach instead:
 
 ```bash
-strings -o ./lib/x86_64/liblocal-config-lib.so | grep -E "poiuyrqoispsx|ouweirit72idn|askoeruqwoie|getPresetUnlockSeed|getKomponentUnlockSeed|getServiceDESSeed"
+objdump -s -j .rodata ./lib/x86_64/liblocal-config-lib.so
 ```
 
-Disassemble to find which offset each function loads:
+**v3.7x and v3.8x** — Seeds are stored in `.rodata` (has a valid virtual address). Standard vaddr mapping works:
 
 ```bash
-objdump -d ./lib/x86_64/liblocal-config-lib.so 2>/dev/null | grep -A10 "getPresetUnlockSeed>"
+# Get file offsets
+strings -o ./lib/x86_64/liblocal-config-lib.so | grep -E "poiuyrqoispsx|ouweirit72idn|askoeruqwoie"
+
+# Disassemble to find which vaddr each function loads
+objdump -d ./lib/x86_64/liblocal-config-lib.so 2>/dev/null | grep -A8 "getPresetUnlockSeed"
+
+# Cross-reference vaddr with section map
+readelf -S --wide ./lib/x86_64/liblocal-config-lib.so | grep rodata
 ```
 
-The `lea` instruction comment shows the memory address loaded. Cross-reference with `strings -o` output.
+The `lea` instruction in each function body shows a comment with the vaddr it loads. For v3.74+, this vaddr falls within `.rodata` and can be mapped directly to the string.
 
-For v3.63 x86_64:
+For v3.63 x86_64, the confirmed mapping is:
 
-| Offset | String | Function |
+| vaddr | String | Function |
 |---|---|---|
 | `0x598` | `poiuyrqoispsx` | `getPresetUnlockSeed` |
 | `0x5a6` | `ouweirit72idn` | `getServiceDESSeed` |
@@ -302,7 +313,7 @@ email  = ""
 
 combined = seed + author + email
 h        = java_hashcode(combined)
-key_str  = f"{h:08d}"      # e.g. "-236174758"
+key_str  = f"{h:08d}"
 key      = key_str.encode('utf-8')[:8]
 ```
 
@@ -478,9 +489,20 @@ Open KLWP, import the preset, and verify all layers are visible and editable.
 
 ## Version-Specific Notes
 
-The seed string changes between KLWP versions. Each time you work with a different APK, extract the seed again from `liblocal-config-lib.so`.
+### Seed Storage Location by Version
 
-### Known Seeds (v3.63, Google Play build)
+A key structural difference was discovered between v3.6x and v3.7x+ builds:
+
+| Version range | Seed location in `.so` | vaddr mapping |
+|---|---|---|
+| v3.6x | `.comment` section (vaddr = 0) | fails — no virtual address |
+| v3.7x and v3.8x | `.rodata` section (vaddr valid) | works via section header map |
+
+In v3.6x, the seeds are stored in the `.comment` ELF section which carries no virtual address, so standard vaddr-to-file-offset conversion via `readelf` section headers will not resolve them. The reliable fallback for v3.6x is to read `.rodata` directly with `objdump -s -j .rodata` and parse the null-terminated strings in order.
+
+In v3.7x and v3.8x, the seeds were moved to `.rodata`, which has a proper virtual address. The `lea` instruction comment in `objdump -d` output points directly into `.rodata`, making the mapping straightforward.
+
+### Known Seeds (all tested versions, Google Play build)
 
 | Function | Seed |
 |---|---|
@@ -491,11 +513,31 @@ The seed string changes between KLWP versions. Each time you work with a differe
 ### Extracting Seeds for Other Versions
 
 ```bash
-strings -o ./lib/x86_64/liblocal-config-lib.so | grep -E "[a-z0-9]{8,20}"
+# Read .rodata section directly (works for all versions)
+objdump -s -j .rodata ./lib/x86_64/liblocal-config-lib.so
 
+# Disassemble to confirm function-to-string mapping
 objdump -d ./lib/x86_64/liblocal-config-lib.so 2>/dev/null \
   | grep -A8 "getPresetUnlockSeed\|getKomponentUnlockSeed\|getServiceDESSeed"
 ```
+
+---
+
+## Findings Across Versions
+
+The following was confirmed by analyzing `liblocal-config-lib.so` extracted from three separate APK builds:
+
+| Version | Build code | Seed location | Seeds identical |
+|---|---|---|---|
+| v3.63 | `363228708` | `.comment` | yes |
+| v3.74 | `374331712` | `.rodata` | yes |
+| v3.82 | `382xxxxxx` | `.rodata` | yes |
+
+**The seed values for all three `SeedHelper` functions are identical across v3.63, v3.74, and v3.82.** This means the seed has not changed across at least this range of versions. In practice, the seed `poiuyrqoispsx` can be used directly without APK extraction for any preset in this version range.
+
+A fourth string `pcq834pqmaicp` appears in the `.rodata` of v3.74 and v3.82, loaded by an additional function that does not exist in v3.63. Its purpose is currently unknown and it is not involved in preset unlock.
+
+**Versions below v3.6x have not yet been tested.** Investigation is ongoing. Follow this repository for updates as earlier versions are analyzed.
 
 ---
 
@@ -538,6 +580,16 @@ pad  = (4 - len(data) % 4) % 4
 data += "=" * pad
 ```
 
+### Seed extraction returns wrong mapping (v3.6x)
+
+In v3.6x, seeds are in `.comment` which has no virtual address. Use direct section dump:
+
+```bash
+objdump -s -j .rodata ./lib/x86_64/liblocal-config-lib.so
+```
+
+Parse the null-terminated strings in order from the output. The order in `.rodata` for v3.63 is: `askoeruqwoie`, `ouweirit72idn`, `poiuyrqoispsx`.
+
 ---
 
 ## Summary
@@ -553,6 +605,8 @@ apktool d --> smali + lib/
         |
         v
 strings + objdump on liblocal-config-lib.so --> seed string
+(v3.6x: read from .comment via objdump -s -j .rodata)
+(v3.7x+: read from .rodata via vaddr mapping)
         |
         v
 java_hashcode(seed + author + email) --> format %08d --> 8-byte DES key
@@ -567,4 +621,4 @@ JSON array of layers --> inject into blank preset shell as viewgroup_items
 copy bitmaps/fonts/icons --> repack as .klwp --> import and verify
 ```
 
-This process was researched and documented through full reverse engineering of KLWP v3.63, tracing the encryption path from `RootLayerModule.smali` through `SeedHelper.smali` to the native `liblocal-config-lib.so`, and finally to `DESHelper.kt` (compiled as `z6/a.smali`).
+This process was researched and documented through full reverse engineering of KLWP v3.63, tracing the encryption path from `RootLayerModule.smali` through `SeedHelper.smali` to the native `liblocal-config-lib.so`, and finally to `DESHelper.kt` (compiled as `z6/a.smali`). Cross-version analysis was extended to v3.74 and v3.82 to confirm seed consistency and document the `.comment` to `.rodata` migration.
